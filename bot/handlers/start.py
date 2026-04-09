@@ -4,6 +4,7 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.config import settings
 from bot.database.models import User
 from bot.keyboards.main_menu import get_main_menu
 
@@ -23,10 +24,11 @@ async def cmd_start(message: Message, session: AsyncSession) -> None:
         ))
         await session.commit()
 
+    is_admin = tg_user.id in settings.ADMIN_IDS
     await message.answer(
         "Привет! Добро пожаловать в BeautyBot 💅\n\n"
         "Я помогу вам записаться к мастеру, узнать об услугах и ценах.",
-        reply_markup=get_main_menu(),
+        reply_markup=get_main_menu(is_admin=is_admin),
     )
 
 
@@ -43,26 +45,13 @@ async def cmd_help(message: Message) -> None:
 async def handle_book(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.answer(
-        "📅 <b>Запись на приём</b>\n\n"
-        "Функция записи скоро будет доступна. Следите за обновлениями!"
+        "📝 <b>Запись на приём</b>\n\nФункция записи скоро будет доступна!"
     )
 
 
-@router.callback_query(lambda c: c.data == "services")
-async def handle_services(callback: CallbackQuery) -> None:
+@router.callback_query(lambda c: c.data == "cancel_booking")
+async def handle_cancel_booking(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.answer(
-        "💅 <b>Наши услуги</b>\n\n"
-        "Маникюр, педикюр, наращивание ногтей и многое другое.\n"
-        "Полный прайс-лист скоро появится здесь!"
-    )
-
-
-@router.callback_query(lambda c: c.data == "contacts")
-async def handle_contacts(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.answer(
-        "📞 <b>Контакты</b>\n\n"
-        "Свяжитесь с нами для уточнения деталей.\n"
-        "Контактная информация скоро будет добавлена."
+        "❌ <b>Отмена записи</b>\n\nФункция отмены скоро будет доступна!"
     )

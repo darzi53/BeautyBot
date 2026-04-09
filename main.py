@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 
 from bot.config import settings
 from bot.database.engine import create_tables
-from bot.handlers import common, start
+from bot.handlers import admin, common, start
 from bot.middlewares.db import DbSessionMiddleware
 
 
@@ -25,6 +25,7 @@ async def main() -> None:
     dp.update.middleware(DbSessionMiddleware())
 
     dp.include_router(start.router)
+    dp.include_router(admin.router)
     dp.include_router(common.router)
 
     await dp.start_polling(bot)

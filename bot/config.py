@@ -6,6 +6,9 @@ class Settings(BaseSettings):
 
     BOT_TOKEN: str
     DATABASE_URL: str = "sqlite+aiosqlite:///./beautybot.db"
+    ADMIN_IDS: list[int] = [702756264]
+    REVIEWS_URL: str = "https://t.me/xolod"
+    PORTFOLIO_URL: str = "https://t.me/xolod"
 
 
 settings = Settings()

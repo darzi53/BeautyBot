@@ -3,3 +3,4 @@ sqlalchemy[asyncio]==2.0.40
 aiosqlite==0.21.0
 pydantic-settings==2.7.0
 alembic==1.14.0
+apscheduler>=3.10.0

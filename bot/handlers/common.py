@@ -6,4 +6,4 @@ router = Router()
 
 @router.message()
 async def fallback(message: Message) -> None:
-    await message.answer("Не понимаю эту команду. Используй /help для справки.")
+    await message.answer("Не понимаю эту команду. Используй меню 👇", reply_markup=None)

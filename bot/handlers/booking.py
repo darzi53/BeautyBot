@@ -1,12 +1,12 @@
+from datetime import datetime, timezone
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from bot.config import settings
 from bot.constants import SERVICES
-from bot.database.models import Booking, User
 from bot.keyboards.admin_booking import get_admin_booking_actions
 from bot.keyboards.confirm_booking import get_confirm_booking
 from bot.keyboards.date_picker import get_date_picker
@@ -25,27 +25,21 @@ router = Router()
 
 
 @router.callback_query(F.data == "book")
-async def handle_book(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+async def handle_book(callback: CallbackQuery, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     await callback.answer()
 
-    # Получаем пользователя из БД
-    result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    user = result.scalar_one_or_none()
+    user = await db.users.find_one({"telegram_id": callback.from_user.id})
     if not user:
         await callback.message.answer("Что-то пошло не так. Попробуй /start заново.")
         return
 
-    # Защита от дубликатов — проверяем активную запись
-    if await has_active_booking(session, user.id):
+    if await has_active_booking(db, str(user["_id"])):
         await callback.message.answer(
             "📅 У тебя уже есть активная запись!\n\n"
             "Дождись её завершения или отмени через меню."
         )
         return
 
-    # Переходим сразу к выбору услуги (Брови)
     await state.set_state(BookingStates.choosing_service)
     await callback.message.answer(
         "🤨 Выбери услугу:",
@@ -74,24 +68,21 @@ async def handle_service_chosen(callback: CallbackQuery, state: FSMContext) -> N
 
 
 @router.callback_query(BookingStates.choosing_service, F.data == "back_to_main")
-async def handle_back_from_services(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+async def handle_back_from_services(callback: CallbackQuery, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     from bot.handlers.start import send_main_menu
     await state.clear()
     await callback.answer()
-    result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    user = result.scalar_one_or_none()
+    user = await db.users.find_one({"telegram_id": callback.from_user.id})
     if user:
-        await send_main_menu(callback, session, user)
+        await send_main_menu(callback, db, user)
 
 
 @router.callback_query(BookingStates.choosing_date, F.data.startswith("date:"))
-async def handle_date_chosen(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+async def handle_date_chosen(callback: CallbackQuery, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     await callback.answer()
     date_str = callback.data.split(":", 1)[1]
 
-    free_slots = await get_free_slots(session, date_str)
+    free_slots = await get_free_slots(db, date_str)
     if not free_slots:
         await callback.message.answer(
             "К сожалению, на эту дату нет свободных слотов. Выбери другую дату 👇",
@@ -152,38 +143,31 @@ async def handle_back_to_dates(callback: CallbackQuery, state: FSMContext) -> No
 @router.callback_query(BookingStates.confirming, F.data == "confirm_book")
 async def handle_confirm_booking(
     callback: CallbackQuery,
-    session: AsyncSession,
+    db: AsyncIOMotorDatabase,
     state: FSMContext,
 ) -> None:
     await callback.answer()
     data = await state.get_data()
     await state.clear()
 
-    # Получаем пользователя
-    result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    user = result.scalar_one_or_none()
+    user = await db.users.find_one({"telegram_id": callback.from_user.id})
     if not user:
         await callback.message.answer("Что-то пошло не так. Попробуй /start заново.")
         return
 
-    # Создаём запись
-    booking = Booking(
-        user_id=user.id,
-        service_name=data["service_name"],
-        service_price=data["service_price"],
-        date=data["date"],
-        time=data["time"],
-        status="pending",
-    )
-    session.add(booking)
-    await session.commit()
-    await session.refresh(booking)
+    result = await db.bookings.insert_one({
+        "user_id": str(user["_id"]),
+        "service_name": data["service_name"],
+        "service_price": data["service_price"],
+        "date": data["date"],
+        "time": data["time"],
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+    })
+    booking_id_str = str(result.inserted_id)
 
     date_label = format_date_long(str_to_date(data["date"]))
 
-    # Сообщение пользователю
     await callback.message.answer(
         "⏳ Заявка отправлена!\n\n"
         f"Услуга: {data['service_name']}\n"
@@ -192,13 +176,12 @@ async def handle_confirm_booking(
         "Жди подтверждения от мастера 💆‍♀️"
     )
 
-    # Уведомление всем администраторам
-    username = f"@{user.username}" if user.username else "нет username"
-    phone = user.phone_number or "не указан"
+    username = f"@{user['username']}" if user.get("username") else "нет username"
+    phone = user.get("phone_number") or "не указан"
     admin_text = (
         f"📅 Новая заявка на запись!\n\n"
-        f"👤 Клиент: {user.full_name} ({username})\n"
-        f"💬 Telegram ID: {user.telegram_id}\n"
+        f"👤 Клиент: {user['full_name']} ({username})\n"
+        f"💬 Telegram ID: {user['telegram_id']}\n"
         f"📞 Телефон: {phone}\n"
         f"Услуга: {data['service_name']}\n"
         f"Дата: {date_label}\n"
@@ -211,42 +194,30 @@ async def handle_confirm_booking(
             await bot.send_message(
                 admin_id,
                 admin_text,
-                reply_markup=get_admin_booking_actions(booking.id),
+                reply_markup=get_admin_booking_actions(booking_id_str),
             )
         except Exception:
             pass
 
-    # Планируем напоминание
     await schedule_reminder(
         bot=bot,
-        booking_id=booking.id,
+        booking_id=booking_id_str,
         date_str=data["date"],
         time_str=data["time"],
-        user_telegram_id=user.telegram_id,
+        user_telegram_id=user["telegram_id"],
         service_name=data["service_name"],
         date_long=date_label,
     )
 
-    # Показываем обновлённое главное меню
     from bot.handlers.start import send_main_menu
-    await send_main_menu(callback, session, user)
+    await send_main_menu(callback, db, user)
 
 
 @router.callback_query(BookingStates.confirming, F.data == "change_book")
 async def handle_change_booking(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    data = await state.get_data()
-    await state.set_state(BookingStates.choosing_time)
-
-    date_label = format_date_long(str_to_date(data["date"]))
-    # Показываем слоты снова (без обращения к БД — просто возвращаемся)
+    await state.set_state(BookingStates.choosing_date)
     await callback.message.answer(
-        f"⏰ Выбери время:\n📅 {date_label}",
-    )
-    # Получаем актуальные слоты из БД (могут занять пока выбирал)
-    # Используем импорт session из data — нет, нужно через closure
-    await callback.message.answer(
-        "Выбери другое время или нажми 🔙 чтобы изменить дату:",
+        "📅 Выбери другую дату:",
         reply_markup=get_date_picker(get_available_dates()),
     )
-    await state.set_state(BookingStates.choosing_date)

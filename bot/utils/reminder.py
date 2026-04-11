@@ -10,7 +10,7 @@ scheduler = AsyncIOScheduler(timezone="Asia/Tashkent")
 
 async def schedule_reminder(
     bot,
-    booking_id: int,
+    booking_id: str,
     date_str: str,
     time_str: str,
     user_telegram_id: int,
@@ -59,7 +59,7 @@ async def send_reminder(
         pass  # Пользователь мог заблокировать бота
 
 
-def cancel_reminder(booking_id: int) -> None:
+def cancel_reminder(booking_id: str) -> None:
     """Отменяет запланированное напоминание."""
     job_id = f"reminder_{booking_id}"
     if scheduler.get_job(job_id):

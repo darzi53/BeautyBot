@@ -7,11 +7,10 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from bson import ObjectId
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from bot.config import settings
-from bot.database.models import BlockedSlot, Booking, User
 from bot.states import AdminSlotStates
 from bot.utils.date_utils import (
     format_date,
@@ -48,38 +47,34 @@ async def handle_admin_panel(callback: CallbackQuery, state: FSMContext) -> None
 # ─── Подтверждение / отклонение записи ────────────────────────────────────────
 
 @router.callback_query(IsAdmin(), F.data.startswith("adm_ok:"))
-async def handle_adm_ok(callback: CallbackQuery, session: AsyncSession) -> None:
+async def handle_adm_ok(callback: CallbackQuery, db: AsyncIOMotorDatabase) -> None:
     await callback.answer()
-    booking_id = int(callback.data.split(":")[1])
+    booking_id_str = callback.data.split(":")[1]
 
-    result = await session.execute(select(Booking).where(Booking.id == booking_id))
-    booking = result.scalar_one_or_none()
+    booking = await db.bookings.find_one({"_id": ObjectId(booking_id_str)})
     if not booking:
         await callback.message.edit_text("⚠️ Запись не найдена.")
         return
 
-    booking.status = "confirmed"
-    await session.commit()
+    await db.bookings.update_one(
+        {"_id": ObjectId(booking_id_str)},
+        {"$set": {"status": "confirmed"}},
+    )
 
-    # Получаем telegram_id пользователя
-    user_result = await session.execute(select(User).where(User.id == booking.user_id))
-    user = user_result.scalar_one_or_none()
+    user = await db.users.find_one({"_id": ObjectId(booking["user_id"])})
+    date_label = format_date_long(str_to_date(booking["date"]))
 
-    date_label = format_date_long(str_to_date(booking.date))
-
-    # Редактируем сообщение у админа
     await callback.message.edit_text(
         callback.message.text + "\n\n✅ <b>Подтверждено</b>",
     )
 
-    # Уведомляем клиента
     if user:
         try:
             await callback.bot.send_message(
-                user.telegram_id,
+                user["telegram_id"],
                 f"🎉 Запись подтверждена!\n\n"
-                f"Услуга: {booking.service_name}\n"
-                f"Дата: {date_label}, {booking.time}\n\n"
+                f"Услуга: {booking['service_name']}\n"
+                f"Дата: {date_label}, {booking['time']}\n\n"
                 "Жду тебя! Если планы изменятся — можешь отменить запись через меню.",
             )
         except Exception:
@@ -87,25 +82,24 @@ async def handle_adm_ok(callback: CallbackQuery, session: AsyncSession) -> None:
 
 
 @router.callback_query(IsAdmin(), F.data.startswith("adm_no:"))
-async def handle_adm_no(callback: CallbackQuery, session: AsyncSession) -> None:
+async def handle_adm_no(callback: CallbackQuery, db: AsyncIOMotorDatabase) -> None:
     await callback.answer()
-    booking_id = int(callback.data.split(":")[1])
+    booking_id_str = callback.data.split(":")[1]
 
-    result = await session.execute(select(Booking).where(Booking.id == booking_id))
-    booking = result.scalar_one_or_none()
+    booking = await db.bookings.find_one({"_id": ObjectId(booking_id_str)})
     if not booking:
         await callback.message.edit_text("⚠️ Запись не найдена.")
         return
 
-    booking.status = "rejected"
-    await session.commit()
+    await db.bookings.update_one(
+        {"_id": ObjectId(booking_id_str)},
+        {"$set": {"status": "rejected"}},
+    )
 
-    user_result = await session.execute(select(User).where(User.id == booking.user_id))
-    user = user_result.scalar_one_or_none()
+    user = await db.users.find_one({"_id": ObjectId(booking["user_id"])})
 
-    # Отменяем напоминание
     from bot.utils.reminder import cancel_reminder
-    cancel_reminder(booking_id)
+    cancel_reminder(booking_id_str)
 
     await callback.message.edit_text(
         callback.message.text + "\n\n❌ <b>Отклонено</b>",
@@ -114,7 +108,7 @@ async def handle_adm_no(callback: CallbackQuery, session: AsyncSession) -> None:
     if user:
         try:
             await callback.bot.send_message(
-                user.telegram_id,
+                user["telegram_id"],
                 "😔 К сожалению, мастер не смог подтвердить запись на это время.\n\n"
                 "Попробуй выбрать другую дату или время через меню.",
             )
@@ -125,18 +119,15 @@ async def handle_adm_no(callback: CallbackQuery, session: AsyncSession) -> None:
 # ─── Список записей (Админ) ────────────────────────────────────────────────────
 
 @router.callback_query(IsAdmin(), F.data == "adm_list")
-async def handle_adm_list(callback: CallbackQuery, session: AsyncSession) -> None:
+async def handle_adm_list(callback: CallbackQuery, db: AsyncIOMotorDatabase) -> None:
     await callback.answer()
 
-    result = await session.execute(
-        select(Booking, User)
-        .join(User, Booking.user_id == User.id)
-        .where(Booking.status.in_(["pending", "confirmed"]))
-        .order_by(Booking.date, Booking.time)
-    )
-    rows = result.fetchall()
+    bookings_cursor = db.bookings.find(
+        {"status": {"$in": ["pending", "confirmed"]}},
+    ).sort([("date", 1), ("time", 1)])
+    bookings = await bookings_cursor.to_list(length=None)
 
-    if not rows:
+    if not bookings:
         await callback.message.answer(
             "📋 Активных записей нет.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -145,15 +136,22 @@ async def handle_adm_list(callback: CallbackQuery, session: AsyncSession) -> Non
         )
         return
 
+    # Загружаем пользователей по их _id
+    user_ids = [ObjectId(b["user_id"]) for b in bookings]
+    users_cursor = db.users.find({"_id": {"$in": user_ids}})
+    users_list = await users_cursor.to_list(length=None)
+    users_map = {str(u["_id"]): u for u in users_list}
+
     lines = ["📋 <b>Активные записи:</b>\n"]
-    for booking, user in rows:
-        date_label = format_date_long(str_to_date(booking.date))
-        status_icon = "⏳" if booking.status == "pending" else "✅"
-        username = f"@{user.username}" if user.username else user.full_name
+    for booking in bookings:
+        user = users_map.get(booking["user_id"], {})
+        date_label = format_date_long(str_to_date(booking["date"]))
+        status_icon = "⏳" if booking["status"] == "pending" else "✅"
+        username = f"@{user['username']}" if user.get("username") else user.get("full_name", "?")
         lines.append(
-            f"{status_icon} <b>{date_label}, {booking.time}</b>\n"
-            f"   {booking.service_name}\n"
-            f"   {username} · {user.phone_number or 'нет тел.'}\n"
+            f"{status_icon} <b>{date_label}, {booking['time']}</b>\n"
+            f"   {booking['service_name']}\n"
+            f"   {username} · {user.get('phone_number') or 'нет тел.'}\n"
         )
 
     await callback.message.answer(
@@ -223,7 +221,7 @@ async def handle_slot_date(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(AdminSlotStates.choosing_time, F.data.startswith("slot_time:"))
-async def handle_slot_time(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+async def handle_slot_time(callback: CallbackQuery, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     await callback.answer()
     time_str = callback.data.split(":", 1)[1]
     data = await state.get_data()
@@ -234,15 +232,9 @@ async def handle_slot_time(callback: CallbackQuery, session: AsyncSession, state
     date_label = format_date_long(str_to_date(date_str))
 
     if action == "block":
-        # Проверяем — нет ли уже
-        existing = await session.execute(
-            select(BlockedSlot).where(
-                BlockedSlot.date == date_str, BlockedSlot.time == time_str
-            )
-        )
-        if not existing.scalar_one_or_none():
-            session.add(BlockedSlot(date=date_str, time=time_str))
-            await session.commit()
+        existing = await db.blocked_slots.find_one({"date": date_str, "time": time_str})
+        if not existing:
+            await db.blocked_slots.insert_one({"date": date_str, "time": time_str})
         await callback.message.answer(
             f"🚫 Слот заблокирован: {date_label}, {time_str}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -250,15 +242,8 @@ async def handle_slot_time(callback: CallbackQuery, session: AsyncSession, state
             ]),
         )
     else:
-        result = await session.execute(
-            select(BlockedSlot).where(
-                BlockedSlot.date == date_str, BlockedSlot.time == time_str
-            )
-        )
-        slot = result.scalar_one_or_none()
-        if slot:
-            await session.delete(slot)
-            await session.commit()
+        result = await db.blocked_slots.delete_one({"date": date_str, "time": time_str})
+        if result.deleted_count > 0:
             await callback.message.answer(
                 f"✅ Слот разблокирован: {date_label}, {time_str}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[

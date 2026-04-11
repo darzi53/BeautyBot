@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -10,11 +12,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from bot.config import settings
-from bot.database.models import User
 from bot.keyboards.main_menu import get_main_menu
 from bot.states import RegistrationStates
 from bot.utils.slot_utils import has_active_booking
@@ -24,27 +24,24 @@ router = Router()
 PRICE_IMAGE = FSInputFile("bot/img/price.jpg")
 
 
-async def _get_or_create_user(session: AsyncSession, tg_user) -> User:
-    result = await session.execute(
-        select(User).where(User.telegram_id == tg_user.id)
-    )
-    user = result.scalar_one_or_none()
+async def _get_or_create_user(db: AsyncIOMotorDatabase, tg_user) -> dict:
+    user = await db.users.find_one({"telegram_id": tg_user.id})
     if user is None:
-        user = User(
-            telegram_id=tg_user.id,
-            username=tg_user.username,
-            full_name=tg_user.full_name or "Unknown",
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
+        result = await db.users.insert_one({
+            "telegram_id": tg_user.id,
+            "username": tg_user.username,
+            "full_name": tg_user.full_name or "Unknown",
+            "phone_number": None,
+            "created_at": datetime.now(timezone.utc),
+        })
+        user = await db.users.find_one({"_id": result.inserted_id})
     return user
 
 
-async def send_main_menu(target: Message | CallbackQuery, session: AsyncSession, user: User) -> None:
+async def send_main_menu(target: Message | CallbackQuery, db: AsyncIOMotorDatabase, user: dict) -> None:
     """Отправляет главное меню с учётом роли и активных записей."""
-    is_admin = user.telegram_id in settings.ADMIN_IDS
-    active = await has_active_booking(session, user.id)
+    is_admin = user["telegram_id"] in settings.ADMIN_IDS
+    active = await has_active_booking(db, str(user["_id"]))
     text = "Главное меню — выбери нужное 👇"
     markup = get_main_menu(is_admin=is_admin, has_active=active)
 
@@ -55,12 +52,12 @@ async def send_main_menu(target: Message | CallbackQuery, session: AsyncSession,
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) -> None:
+async def cmd_start(message: Message, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     await state.clear()
     tg_user = message.from_user
-    user = await _get_or_create_user(session, tg_user)
+    user = await _get_or_create_user(db, tg_user)
 
-    if not user.phone_number:
+    if not user.get("phone_number"):
         await state.set_state(RegistrationStates.waiting_for_phone)
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
@@ -80,40 +77,38 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) 
             "Выбирай, что тебя интересует 👇",
             reply_markup=ReplyKeyboardRemove(),
         )
-        await send_main_menu(message, session, user)
+        await send_main_menu(message, db, user)
 
 
 @router.message(RegistrationStates.waiting_for_phone, F.contact)
-async def handle_contact(message: Message, session: AsyncSession, state: FSMContext) -> None:
+async def handle_contact(message: Message, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     contact: Contact = message.contact
-    await _save_phone(message, session, state, contact.phone_number)
+    await _save_phone(message, db, state, contact.phone_number)
 
 
 @router.message(RegistrationStates.waiting_for_phone, F.text)
-async def handle_phone_text(message: Message, session: AsyncSession, state: FSMContext) -> None:
+async def handle_phone_text(message: Message, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     phone = message.text.strip()
     digits = "".join(c for c in phone if c.isdigit())
     if len(digits) < 7:
         await message.answer("Пожалуйста, введи корректный номер телефона.")
         return
-    await _save_phone(message, session, state, phone)
+    await _save_phone(message, db, state, phone)
 
 
-async def _save_phone(message: Message, session: AsyncSession, state: FSMContext, phone: str) -> None:
-    result = await session.execute(
-        select(User).where(User.telegram_id == message.from_user.id)
+async def _save_phone(message: Message, db: AsyncIOMotorDatabase, state: FSMContext, phone: str) -> None:
+    await db.users.update_one(
+        {"telegram_id": message.from_user.id},
+        {"$set": {"phone_number": phone}},
     )
-    user = result.scalar_one_or_none()
-    if user:
-        user.phone_number = phone
-        await session.commit()
+    user = await db.users.find_one({"telegram_id": message.from_user.id})
 
     await state.clear()
     await message.answer(
         "✅ Номер сохранён!\n\nВыбирай, что тебя интересует 👇",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await send_main_menu(message, session, user)
+    await send_main_menu(message, db, user)
 
 
 @router.message(Command("help"))
@@ -135,12 +130,9 @@ async def handle_prices(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "back_to_main")
-async def handle_back_to_main(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+async def handle_back_to_main(callback: CallbackQuery, db: AsyncIOMotorDatabase, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    result = await session.execute(
-        select(User).where(User.telegram_id == callback.from_user.id)
-    )
-    user = result.scalar_one_or_none()
+    user = await db.users.find_one({"telegram_id": callback.from_user.id})
     if user:
-        await send_main_menu(callback, session, user)
+        await send_main_menu(callback, db, user)

@@ -6,17 +6,18 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from bot.config import settings
-from bot.database.engine import create_tables
+from bot.database.engine import connect_db, create_indexes, close_db
 from bot.handlers import admin, common, start
 from bot.handlers import booking, cancellation
-from bot.middlewares.db import DbSessionMiddleware
+from bot.middlewares.db import DbMiddleware
 from bot.utils.reminder import scheduler
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    await create_tables()
+    await connect_db()
+    await create_indexes()
 
     bot = Bot(
         token=settings.BOT_TOKEN,
@@ -24,7 +25,7 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    dp.update.middleware(DbSessionMiddleware())
+    dp.update.middleware(DbMiddleware())
 
     dp.include_router(start.router)
     dp.include_router(booking.router)
@@ -39,6 +40,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown()
+        await close_db()
 
 
 if __name__ == "__main__":

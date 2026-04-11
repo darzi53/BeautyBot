@@ -1,7 +1,7 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def get_admin_booking_actions(booking_id: int) -> InlineKeyboardMarkup:
+def get_admin_booking_actions(booking_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm_ok:{booking_id}"),

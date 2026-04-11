@@ -1,31 +1,32 @@
 import logging
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo import ASCENDING
 
 from bot.config import settings
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False)
-
-async_session_maker = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+client: AsyncIOMotorClient = None
+db: AsyncIOMotorDatabase = None
 
 
-async def create_tables() -> None:
-    from bot.database.models import Base
+async def connect_db() -> None:
+    global client, db
+    client = AsyncIOMotorClient(settings.MONGODB_URL)
+    db = client.beautybot
+    logging.info("Connected to MongoDB")
 
-    async with engine.begin() as conn:
-        # Создаём новые таблицы (уже существующие не трогаются)
-        await conn.run_sync(Base.metadata.create_all)
 
-        # Добавляем phone_number в users если колонки ещё нет
-        try:
-            await conn.execute(
-                text("ALTER TABLE users ADD COLUMN phone_number VARCHAR(20)")
-            )
-            logging.info("Миграция: добавлена колонка users.phone_number")
-        except Exception:
-            pass  # Колонка уже существует
+async def create_indexes() -> None:
+    await db.users.create_index("telegram_id", unique=True)
+    await db.bookings.create_index("user_id")
+    await db.bookings.create_index([("date", ASCENDING), ("time", ASCENDING)])
+    await db.blocked_slots.create_index(
+        [("date", ASCENDING), ("time", ASCENDING)], unique=True
+    )
+    logging.info("MongoDB indexes created")
+
+
+async def close_db() -> None:
+    if client:
+        client.close()
+        logging.info("MongoDB connection closed")
